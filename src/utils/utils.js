@@ -51,7 +51,7 @@ function handleUserMessage(extracted, antigravityMessages){
   })
 }
 
-// 修复思考签名缺失：为无 content 的工具调用补充 thought
+// 修复思考签名缺失：为无 content 的工具调用补充 thought，并在 functionCall part 上标记 thought:true
 function handleAssistantMessage(message, antigravityMessages){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
@@ -64,7 +64,8 @@ function handleAssistantMessage(message, antigravityMessages){
       args: {
         query: toolCall.function.arguments
       }
-    }
+    },
+    thought: true
   })) : [];
   
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
