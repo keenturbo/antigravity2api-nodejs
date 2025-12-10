@@ -3,20 +3,15 @@ import tokenManager from '../auth/token_manager.js';
 import { generateRequestId } from './idGenerator.js';
 import os from 'os';
 
+// 仅 Gemini 思考模型需要 thought 标记
 function needsThoughtFlag(modelName = ''){
   return modelName.startsWith('gemini-') && modelName.includes('thinking');
 }
-function isClaudeThinking(modelName = ''){
-  return modelName.includes('claude') && modelName.includes('-thinking');
-}
 
-// Claude 思考块：type=thinking；Gemini 思考块：text+thought:true
-function buildThinkingPart(modelName, text, enableThinking){
-  if (!enableThinking) return null;
-  if (isClaudeThinking(modelName)){
-    return { type: 'thinking', content: text };
-  }
-  if (needsThoughtFlag(modelName)){
+function buildThinkingPart(modelName, text, needsThought){
+  if (!needsThought) return null;
+  // Gemini 思考：text + thought:true
+  if (needsThoughtFlag(modelName)) {
     return { text, thought: true };
   }
   return null;
@@ -51,33 +46,31 @@ function extractImagesFromContent(content) {
   return result;
 }
 
-function sanitizeContent(content, enableThinking, modelName){
+// 深度消毒 message.content：去掉/转换 thinking
+function sanitizeContent(content, needsThought, modelName){
   if (typeof content === 'string') return content;
+  const toThought = needsThoughtFlag(modelName) ? needsThought : false;
+
   if (Array.isArray(content)){
     return content.map(item=>{
-      // 把上游的 thinking 对象转成文本/思考块
-      if (item.thinking){
+      if (item?.thinking){
         const txt = item.thinking.content || item.thinking.text || '';
-        const p = buildThinkingPart(modelName, txt, enableThinking);
+        const p = buildThinkingPart(modelName, txt, toThought);
         return p ?? { text: txt };
       }
-      if (item.type === 'thinking'){
+      if (item?.type === 'thinking'){
         const txt = item.content || item.text || '';
-        const p = buildThinkingPart(modelName, txt, enableThinking);
+        const p = buildThinkingPart(modelName, txt, toThought);
         return p ?? { text: txt };
       }
-      if (item.type === 'text'){
-        return { text: item.text || '' };
-      }
-      if (item.type === 'image_url'){
-        return item; // 保留 multimodal
-      }
+      if (item?.type === 'text') return { text: item.text || '' };
+      if (item?.type === 'image_url') return item;
       return item;
     });
   }
   if (content && typeof content === 'object' && content.thinking){
     const txt = content.thinking.content || content.thinking.text || '';
-    const p = buildThinkingPart(modelName, txt, enableThinking);
+    const p = buildThinkingPart(modelName, txt, toThought);
     return p ?? { text: txt };
   }
   return content;
@@ -93,12 +86,11 @@ function handleUserMessage(extracted, antigravityMessages){
   })
 }
 
-function handleAssistantMessage(message, antigravityMessages, modelName, enableThinking){
+function handleAssistantMessage(message, antigravityMessages, modelName, needsThought){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
-  const needsThought = needsThoughtFlag(modelName);
-  const isClaudeThink = isClaudeThinking(modelName);
+  const thoughtFlag = needsThoughtFlag(modelName) && needsThought;
 
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => ({
     functionCall: {
@@ -106,11 +98,11 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
       name: toolCall.function.name,
       args: { query: toolCall.function.arguments }
     },
-    ...(needsThought ? { thought: true } : {})
+    ...(thoughtFlag ? { thought: true } : {})
   })) : [];
 
   const prependThinking = hasToolCalls
-    ? buildThinkingPart(modelName, "I will use the tool to process this request.", enableThinking)
+    ? buildThinkingPart(modelName, "I will use the tool to process this request.", thoughtFlag)
     : null;
 
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
@@ -119,7 +111,7 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
   } else {
     const parts = [];
 
-    // Claude thinking: 工具调用时必须先有 thinking block
+    // Gemini 思考：工具调用时可先加思考
     if (hasToolCalls && prependThinking){
       parts.push(prependThinking);
     }
@@ -127,8 +119,8 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
     if (hasContent){
       parts.push({ text: message.content.trimEnd() });
     } else if (hasToolCalls && prependThinking){
-      // 已经加过思考，不再加文本
-    } else if (hasToolCalls && enableThinking && needsThought){
+      // 已加思考，跳过
+    } else if (hasToolCalls && thoughtFlag){
       parts.push({ text: "I will use the tool to process this request.", thought: true });
     }
 
@@ -170,36 +162,39 @@ function handleToolCall(message, antigravityMessages){
 }
 
 // 深度清洗 parts，移除/转换 thinking 残留
-function deepSanitizeParts(parts, enableThinking, modelName){
+function deepSanitizeParts(parts, needsThought, modelName){
+  const thoughtFlag = needsThoughtFlag(modelName) && needsThought;
   return (parts || []).map(p => {
     if (p.thinking){
       const txt = p.thinking.content || p.thinking.text || '';
-      const t = buildThinkingPart(modelName, txt, enableThinking);
+      const t = buildThinkingPart(modelName, txt, thoughtFlag);
       return t ?? { text: txt };
     }
     if (p.type === 'thinking'){
-      // Claude thinking 合法：保留
-      return isClaudeThinking(modelName) ? p : { text: p.content || p.text || '' };
+      // 统一转文本（Claude 在本层不使用 type 结构）
+      const txt = p.content || p.text || '';
+      const t = buildThinkingPart(modelName, txt, thoughtFlag);
+      return t ?? { text: txt };
     }
     if (p.parts){
-      return { ...p, parts: deepSanitizeParts(p.parts, enableThinking, modelName) };
+      return { ...p, parts: deepSanitizeParts(p.parts, needsThought, modelName) };
     }
     return p;
   });
 }
 
-function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
+function openaiMessageToAntigravity(openaiMessages, modelName, needsThought){
   const antigravityMessages = [];
   for (const message of openaiMessages) {
     const sanitized = {
       ...message,
-      content: sanitizeContent(message.content, enableThinking, modelName)
+      content: sanitizeContent(message.content, needsThought, modelName)
     };
     if (sanitized.role === "user" || sanitized.role === "system") {
       const extracted = extractImagesFromContent(sanitized.content);
       handleUserMessage(extracted, antigravityMessages);
     } else if (sanitized.role === "assistant") {
-      handleAssistantMessage(sanitized, antigravityMessages, modelName, enableThinking);
+      handleAssistantMessage(sanitized, antigravityMessages, modelName, needsThought);
     } else if (sanitized.role === "tool") {
       handleToolCall(sanitized, antigravityMessages);
     }
@@ -259,22 +254,22 @@ function modelMapping(modelName){
   return modelName;
 }
 
+// 仅 Gemini 思考模型启用 thinking；Claude 全部视作非思考路径
 function isEnableThinking(modelName){
-  return modelName.endsWith('-thinking') ||
-    modelName === 'gemini-2.5-pro' ||
-    modelName.startsWith('gemini-3-pro-') ||
+  return modelName.startsWith('gemini-') ||
     modelName === "rev19-uic3-1p" ||
-    modelName === "gpt-oss-120b-medium"
+    modelName === "gpt-oss-120b-medium";
 }
 
 function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,token){
   const enableThinking = isEnableThinking(modelName);
+  const needsThought = needsThoughtFlag(modelName) && enableThinking;
   const actualModelName = modelMapping(modelName);
 
-  const contents = openaiMessageToAntigravity(openaiMessages, modelName, enableThinking);
+  const contents = openaiMessageToAntigravity(openaiMessages, modelName, needsThought);
   const sanitizedContents = contents.map(msg => ({
     ...msg,
-    parts: deepSanitizeParts(msg.parts, enableThinking, modelName)
+    parts: deepSanitizeParts(msg.parts, needsThought, modelName)
   }));
 
   return{
@@ -315,7 +310,6 @@ function getDefaultIp(){
   }
   return '127.0.0.1';
 }
-
 export{
   generateRequestId,
   generateRequestBody,
