@@ -62,14 +62,17 @@ function buildThinkingPart(isClaude, text){
     : { text, thought: true };
 }
 
-// 修复思考签名缺失：为无 content 的工具调用补充思考；Gemini 继续使用 thought:true，Claude 则生成 thinking.signature
-function handleAssistantMessage(message, antigravityMessages, modelName){
+// 修复思考签名缺失：仅在 enableThinking=true 时注入思考；
+// Gemini 继续使用 thought:true，Claude thinking 生成 thinking.signature；
+// 非 thinking 模型不注入思考，避免无 signature 报错。
+function handleAssistantMessage(message, antigravityMessages, modelName, enableThinking){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
   const isClaude = isClaudeThinking(modelName);
+  const isGemini = modelName.startsWith('gemini-');
   const defaultThoughtText = "I will use the tool to process this request.";
-  
+
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => ({
     functionCall: {
       id: toolCall.id,
@@ -78,25 +81,34 @@ function handleAssistantMessage(message, antigravityMessages, modelName){
         query: toolCall.function.arguments
       }
     },
-    ...(isClaude ? {} : { thought: true })
+    // 只有思考模型的 Gemini 继续携带 thought:true；Claude 不强制 thought:true
+    ...(enableThinking && isGemini ? { thought: true } : {})
   })) : [];
-  
+
+  // 仅思考模型才注入思考 part
+  const maybeThought = enableThinking ? buildThinkingPart(isClaude, defaultThoughtText) : null;
+
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
-    // 先补思考，再追加工具调用
-    lastMessage.parts.push(
-      buildThinkingPart(isClaude, defaultThoughtText),
-      ...antigravityTools
-    )
+    // 如果需要思考，先补思考，再追加工具调用
+    if (maybeThought) lastMessage.parts.push(maybeThought);
+    lastMessage.parts.push(...antigravityTools);
   }else{
     const parts = [];
-    // 有工具调用但无内容时，补默认思考
-    if (hasToolCalls && !hasContent) {
-      parts.push(buildThinkingPart(isClaude, defaultThoughtText));
-    } else if (hasContent) {
-      parts.push({ text: message.content.trimEnd() });
+    if (enableThinking) {
+      // 思考模型：有工具且无内容 → 补思考；有内容 → 用内容
+      if (hasToolCalls && !hasContent) {
+        parts.push(maybeThought);
+      } else if (hasContent) {
+        parts.push({ text: message.content.trimEnd() });
+      }
+    } else {
+      // 非思考模型：只保留内容，不注入思考
+      if (hasContent) {
+        parts.push({ text: message.content.trimEnd() });
+      }
     }
     parts.push(...antigravityTools);
-    
+
     antigravityMessages.push({
       role: "model",
       parts
@@ -141,14 +153,14 @@ function handleToolCall(message, antigravityMessages){
     });
   }
 }
-function openaiMessageToAntigravity(openaiMessages, modelName){
+function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
   const antigravityMessages = [];
   for (const message of openaiMessages) {
     if (message.role === "user" || message.role === "system") {
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages);
     } else if (message.role === "assistant") {
-      handleAssistantMessage(message, antigravityMessages, modelName);
+      handleAssistantMessage(message, antigravityMessages, modelName, enableThinking);
     } else if (message.role === "tool") {
       handleToolCall(message, antigravityMessages);
     }
@@ -228,7 +240,7 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
     project: token.projectId,
     requestId: generateRequestId(),
     request: {
-      contents: openaiMessageToAntigravity(openaiMessages, modelName),
+      contents: openaiMessageToAntigravity(openaiMessages, modelName, enableThinking),
       systemInstruction: {
         role: "user",
         parts: [{ text: config.systemInstruction }]
