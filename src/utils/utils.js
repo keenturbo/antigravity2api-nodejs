@@ -89,9 +89,9 @@ function buildThinkingPart(text){
   return { text, thought: true };
 }
 
-// 修复思考注入：仅在 enableThinking=true 时注入思考；
-// 思考模型用 { text, thought:true }，非思考模型不注入思考。
-function handleAssistantMessage(message, antigravityMessages, modelName, enableThinking){
+// 仅在 needsThought=true 时注入思考；
+// Gemini Thinking 需要 thought 标记，Claude 等非 Gemini 即便是 thinking 模型也不用 thought。
+function handleAssistantMessage(message, antigravityMessages, modelName, needsThought){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const rawContent = sanitizeContent(message.content);
@@ -111,17 +111,17 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
         query: toolCall.function.arguments
       }
     },
-    ...(enableThinking ? { thought: true } : {})
+    ...(needsThought ? { thought: true } : {})
   })) : [];
 
-  const maybeThought = enableThinking ? buildThinkingPart(defaultThoughtText) : null;
+  const maybeThought = needsThought ? buildThinkingPart(defaultThoughtText) : null;
 
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
     if (maybeThought) lastMessage.parts.push(maybeThought);
     lastMessage.parts.push(...antigravityTools);
   }else{
     const parts = [];
-    if (enableThinking) {
+    if (needsThought) {
       if (hasToolCalls && !hasContent) {
         if (maybeThought) parts.push(maybeThought);
       } else if (hasContent) {
@@ -178,7 +178,15 @@ function handleToolCall(message, antigravityMessages){
     });
   }
 }
-function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
+
+// 判定是否需要 thought 标记（只针对 Gemini 思考模型）
+function needsThoughtFlag(modelName){
+  return modelName === 'gemini-2.5-pro' ||
+    modelName.startsWith('gemini-3-pro-') ||
+    modelName === 'gemini-2.5-flash-thinking';
+}
+
+function openaiMessageToAntigravity(openaiMessages, modelName, needsThought){
   const antigravityMessages = [];
   for (const message of openaiMessages) {
     // 消毒：把外部传入的 thinking 对象转换为纯 text / 标准 multimodal
@@ -189,7 +197,7 @@ function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
       const extracted = extractImagesFromContent(msg.content);
       handleUserMessage(extracted, antigravityMessages);
     } else if (msg.role === "assistant") {
-      handleAssistantMessage(msg, antigravityMessages, modelName, enableThinking);
+      handleAssistantMessage(msg, antigravityMessages, modelName, needsThought);
     } else if (msg.role === "tool") {
       handleToolCall(msg, antigravityMessages);
     }
@@ -199,22 +207,22 @@ function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
 }
 
 // 终极消毒：确保 parts 树中不残留 thinking 字段
-function deepSanitizeParts(parts, enableThinking) {
+function deepSanitizeParts(parts, needsThought) {
   if (!parts) return [];
   const cleaned = [];
   for (const part of parts) {
     if (!part) continue;
     if (part.thinking) {
-      cleaned.push({ text: part.thinking.content || '', ...(enableThinking ? { thought: true } : {}) });
+      cleaned.push({ text: part.thinking.content || '', ...(needsThought ? { thought: true } : {}) });
       continue;
     }
     if (part.type === 'thinking') {
-      cleaned.push({ text: part.content || part.text || '', ...(enableThinking ? { thought: true } : {}) });
+      cleaned.push({ text: part.content || part.text || '', ...(needsThought ? { thought: true } : {}) });
       continue;
     }
     const clone = { ...part };
     if (clone.thinking) delete clone.thinking;
-    if (clone.parts) clone.parts = deepSanitizeParts(clone.parts, enableThinking);
+    if (clone.parts) clone.parts = deepSanitizeParts(clone.parts, needsThought);
     cleaned.push(clone);
   }
   return cleaned;
@@ -271,6 +279,7 @@ function modelMapping(modelName){
   return modelName;
 }
 
+// 是否允许思考（决定 generationConfig.thinkingConfig），但思考标记仅在 needsThoughtFlag 为真时加。
 function isEnableThinking(modelName){
   return modelName.endsWith('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
@@ -280,13 +289,15 @@ function isEnableThinking(modelName){
 }
 
 function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,token){
-  
+  // 只对 Gemini 思考模型加 thought 标记，其余即便带 thinking 后缀也不加 thought。
+  const needsThought = needsThoughtFlag(modelName);
+  // 思考开关用于 generationConfig；若你希望非 Gemini thinking 也带 includeThoughts，可保留 isEnableThinking；否则可改为 needsThought。
   const enableThinking = isEnableThinking(modelName);
   const actualModelName = modelMapping(modelName);
-  const contents = openaiMessageToAntigravity(openaiMessages, modelName, enableThinking);
+  const contents = openaiMessageToAntigravity(openaiMessages, modelName, needsThought);
   const sanitizedContents = contents.map(msg => ({
     ...msg,
-    parts: deepSanitizeParts(msg.parts, enableThinking)
+    parts: deepSanitizeParts(msg.parts, needsThought)
   }));
   
   return{
