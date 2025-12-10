@@ -197,6 +197,29 @@ function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
   
   return antigravityMessages;
 }
+
+// 终极消毒：确保 parts 树中不残留 thinking 字段
+function deepSanitizeParts(parts, enableThinking) {
+  if (!parts) return [];
+  const cleaned = [];
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.thinking) {
+      cleaned.push({ text: part.thinking.content || '', ...(enableThinking ? { thought: true } : {}) });
+      continue;
+    }
+    if (part.type === 'thinking') {
+      cleaned.push({ text: part.content || part.text || '', ...(enableThinking ? { thought: true } : {}) });
+      continue;
+    }
+    const clone = { ...part };
+    if (clone.thinking) delete clone.thinking;
+    if (clone.parts) clone.parts = deepSanitizeParts(clone.parts, enableThinking);
+    cleaned.push(clone);
+  }
+  return cleaned;
+}
+
 function generateGenerationConfig(parameters, enableThinking, actualModelName){
   const generationConfig = {
     topP: parameters.top_p ?? config.defaults.top_p,
@@ -260,12 +283,17 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
   
   const enableThinking = isEnableThinking(modelName);
   const actualModelName = modelMapping(modelName);
+  const contents = openaiMessageToAntigravity(openaiMessages, modelName, enableThinking);
+  const sanitizedContents = contents.map(msg => ({
+    ...msg,
+    parts: deepSanitizeParts(msg.parts, enableThinking)
+  }));
   
   return{
     project: token.projectId,
     requestId: generateRequestId(),
     request: {
-      contents: openaiMessageToAntigravity(openaiMessages, modelName, enableThinking),
+      contents: sanitizedContents,
       systemInstruction: {
         role: "user",
         parts: [{ text: config.systemInstruction }]
