@@ -3,11 +3,6 @@ import tokenManager from '../auth/token_manager.js';
 import { generateRequestId } from './idGenerator.js';
 import os from 'os';
 
-function createThinkingSignature(){
-  // 使用现有的请求ID生成器确保唯一性
-  return generateRequestId();
-}
-
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
 
@@ -56,21 +51,17 @@ function handleUserMessage(extracted, antigravityMessages){
   })
 }
 
-function buildThinkingPart(isClaude, text){
-  return isClaude
-    ? { thinking: { signature: createThinkingSignature(), content: text } }
-    : { text, thought: true };
+// 统一思考格式：所有思考模型都用 Gemini 兼容的 { text, thought: true }
+function buildThinkingPart(text){
+  return { text, thought: true };
 }
 
-// 修复思考签名缺失：仅在 enableThinking=true 时注入思考；
-// Gemini 继续使用 thought:true，Claude thinking 生成 thinking.signature；
-// 非 thinking 模型不注入思考，避免无 signature 报错。
+// 修复思考注入：仅在 enableThinking=true 时注入思考；
+// 思考模型用 { text, thought:true }，非思考模型不注入思考。
 function handleAssistantMessage(message, antigravityMessages, modelName, enableThinking){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
-  const isClaude = isClaudeThinking(modelName);
-  const isGemini = modelName.startsWith('gemini-');
   const defaultThoughtText = "I will use the tool to process this request.";
 
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => ({
@@ -81,28 +72,23 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
         query: toolCall.function.arguments
       }
     },
-    // 只有思考模型的 Gemini 继续携带 thought:true；Claude 不强制 thought:true
-    ...(enableThinking && isGemini ? { thought: true } : {})
+    ...(enableThinking ? { thought: true } : {})
   })) : [];
 
-  // 仅思考模型才注入思考 part
-  const maybeThought = enableThinking ? buildThinkingPart(isClaude, defaultThoughtText) : null;
+  const maybeThought = enableThinking ? buildThinkingPart(defaultThoughtText) : null;
 
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
-    // 如果需要思考，先补思考，再追加工具调用
     if (maybeThought) lastMessage.parts.push(maybeThought);
     lastMessage.parts.push(...antigravityTools);
   }else{
     const parts = [];
     if (enableThinking) {
-      // 思考模型：有工具且无内容 → 补思考；有内容 → 用内容
       if (hasToolCalls && !hasContent) {
         parts.push(maybeThought);
       } else if (hasContent) {
         parts.push({ text: message.content.trimEnd() });
       }
     } else {
-      // 非思考模型：只保留内容，不注入思考
       if (hasContent) {
         parts.push({ text: message.content.trimEnd() });
       }
@@ -225,10 +211,6 @@ function isEnableThinking(modelName){
     modelName.startsWith('gemini-3-pro-') ||
     modelName === "rev19-uic3-1p" ||
     modelName === "gpt-oss-120b-medium"
-}
-
-function isClaudeThinking(modelName){
-  return modelName.startsWith('claude') && isEnableThinking(modelName);
 }
 
 function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,token){
