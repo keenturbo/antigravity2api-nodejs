@@ -50,6 +50,8 @@ function handleUserMessage(extracted, antigravityMessages){
     ]
   })
 }
+
+// 修复思考签名缺失：为无 content 的工具调用补充 thought
 function handleAssistantMessage(message, antigravityMessages){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
@@ -66,10 +68,19 @@ function handleAssistantMessage(message, antigravityMessages){
   })) : [];
   
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
-    lastMessage.parts.push(...antigravityTools)
+    // 先补思考，再追加工具调用
+    lastMessage.parts.push(
+      { text: "I will use the tool to process this request.", thought: true },
+      ...antigravityTools
+    )
   }else{
     const parts = [];
-    if (hasContent) parts.push({ text: message.content.trimEnd() });
+    // 有工具调用但无内容时，补默认思考
+    if (hasToolCalls && !hasContent) {
+      parts.push({ text: "I will use the tool to process this request.", thought: true });
+    } else if (hasContent) {
+      parts.push({ text: message.content.trimEnd() });
+    }
     parts.push(...antigravityTools);
     
     antigravityMessages.push({
@@ -78,6 +89,7 @@ function handleAssistantMessage(message, antigravityMessages){
     })
   }
 }
+
 function handleToolCall(message, antigravityMessages){
   // 从之前的 model 消息中找到对应的 functionCall name
   let functionName = '';
