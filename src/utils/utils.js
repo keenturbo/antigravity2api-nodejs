@@ -39,6 +39,15 @@ function extractImagesFromContent(content) {
 
   return result;
 }
+function sanitizeContent(rawContent){
+  // 规范化：把任何 thinking/content 结构都转换为 text; 保留字符串；数组类型按 text/image_url 解析
+  if (rawContent && typeof rawContent === 'object' && rawContent.thinking) {
+    // 如果是 { thinking: { content: '...', signature: ... } }
+    const text = rawContent.thinking.content || '';
+    return text;
+  }
+  return rawContent;
+}
 function handleUserMessage(extracted, antigravityMessages){
   antigravityMessages.push({
     role: "user",
@@ -61,7 +70,8 @@ function buildThinkingPart(text){
 function handleAssistantMessage(message, antigravityMessages, modelName, enableThinking){
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
-  const hasContent = message.content && message.content.trim() !== '';
+  const rawContent = sanitizeContent(message.content);
+  const hasContent = rawContent && typeof rawContent === 'string' && rawContent.trim() !== '';
   const defaultThoughtText = "I will use the tool to process this request.";
 
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => ({
@@ -86,11 +96,11 @@ function handleAssistantMessage(message, antigravityMessages, modelName, enableT
       if (hasToolCalls && !hasContent) {
         parts.push(maybeThought);
       } else if (hasContent) {
-        parts.push({ text: message.content.trimEnd() });
+        parts.push({ text: rawContent.trimEnd() });
       }
     } else {
       if (hasContent) {
-        parts.push({ text: message.content.trimEnd() });
+        parts.push({ text: rawContent.trimEnd() });
       }
     }
     parts.push(...antigravityTools);
@@ -142,6 +152,11 @@ function handleToolCall(message, antigravityMessages){
 function openaiMessageToAntigravity(openaiMessages, modelName, enableThinking){
   const antigravityMessages = [];
   for (const message of openaiMessages) {
+    // 消毒：把外部传入的 thinking 对象转换为纯 text
+    if (message && message.content && typeof message.content === 'object' && message.content.thinking) {
+      message = { ...message, content: sanitizeContent(message.content) };
+    }
+
     if (message.role === "user" || message.role === "system") {
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages);
