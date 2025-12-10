@@ -3,73 +3,86 @@ import tokenManager from '../auth/token_manager.js';
 import { generateRequestId } from './idGenerator.js';
 import os from 'os';
 
-function createThinkingSignature(){
-  // 使用现有的请求ID生成器确保唯一性
-  return generateRequestId();
-}
-
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
-
-  // 如果content是字符串，直接返回
   if (typeof content === 'string') {
     result.text = content;
     return result;
   }
-
-  // 如果content是数组（multimodal格式）
   if (Array.isArray(content)) {
     for (const item of content) {
       if (item.type === 'text') {
         result.text += item.text;
       } else if (item.type === 'image_url') {
-        // 提取base64图片数据
         const imageUrl = item.image_url?.url || '';
-
-        // 匹配 data:image/{format};base64,{data} 格式
         const match = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
         if (match) {
-          const format = match[1]; // 例如 png, jpeg, jpg
+          const format = match[1];
           const base64Data = match[2];
           result.images.push({
             inlineData: {
               mimeType: `image/${format}`,
               data: base64Data
             }
-          })
+          });
         }
       }
     }
   }
-
   return result;
 }
-function handleUserMessage(extracted, antigravityMessages){
+
+function handleUserMessage(extracted, antigravityMessages) {
   antigravityMessages.push({
     role: "user",
     parts: [
-      {
-        text: extracted.text
-      },
+      { text: extracted.text },
       ...extracted.images
     ]
-  })
+  });
 }
 
-function buildThinkingPart(isClaude, text){
-  return isClaude
-    ? { thinking: { signature: createThinkingSignature(), content: text } }
-    : { text, thought: true };
+// 仅 Gemini 需要 thought:true
+function needsThoughtFlag(modelName = '') {
+  return modelName.startsWith('gemini-');
 }
 
-// 修复思考签名缺失：为无 content 的工具调用补充思考；Gemini 继续使用 thought:true，Claude 则生成 thinking.signature
-function handleAssistantMessage(message, antigravityMessages, modelName){
+// Claude 思考模型判定（仅用于去除 thought，不做特殊字段）
+function isClaudeThinking(modelName = '') {
+  return modelName.startsWith('claude') && modelName.endsWith('-thinking');
+}
+
+const defaultThoughtText = "Thought: I need to use the tool to fulfill the request.";
+
+function sanitizeIncomingContent(content) {
+  // 去掉上游可能带入的 thinking 字段
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(item => {
+      if (item.thinking) {
+        return { text: item.thinking.content || item.thinking.text || '' };
+      }
+      if (item.type === 'thinking') {
+        return { text: item.content || item.text || '' };
+      }
+      if (item.type === 'text') return { text: item.text || '' };
+      return item; // image_url 或其它保持
+    });
+  }
+  if (content && typeof content === 'object' && content.thinking) {
+    return { text: content.thinking.content || content.thinking.text || '' };
+  }
+  return content;
+}
+
+// 核心：按模型决定是否加 thought，以及在无 content 有工具时补思考文本
+function handleAssistantMessage(message, antigravityMessages, modelName) {
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
-  const isClaude = isClaudeThinking(modelName);
-  const defaultThoughtText = "I will use the tool to process this request.";
-  
+  const needsThought = needsThoughtFlag(modelName);
+  const isClaudeThink = isClaudeThinking(modelName);
+
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => ({
     functionCall: {
       id: toolCall.id,
@@ -78,34 +91,38 @@ function handleAssistantMessage(message, antigravityMessages, modelName){
         query: toolCall.function.arguments
       }
     },
-    ...(isClaude ? {} : { thought: true })
+    ...(needsThought ? { thought: true } : {})
   })) : [];
-  
-  if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
-    // 先补思考，再追加工具调用
+
+  if (lastMessage?.role === "model" && hasToolCalls && !hasContent) {
+    // 补思考文本，再追加工具
     lastMessage.parts.push(
-      buildThinkingPart(isClaude, defaultThoughtText),
+      needsThought
+        ? { text: defaultThoughtText, thought: true }
+        : { text: defaultThoughtText },
       ...antigravityTools
-    )
-  }else{
+    );
+  } else {
     const parts = [];
-    // 有工具调用但无内容时，补默认思考
     if (hasToolCalls && !hasContent) {
-      parts.push(buildThinkingPart(isClaude, defaultThoughtText));
+      parts.push(
+        needsThought
+          ? { text: defaultThoughtText, thought: true }
+          : { text: defaultThoughtText }
+      );
     } else if (hasContent) {
       parts.push({ text: message.content.trimEnd() });
     }
     parts.push(...antigravityTools);
-    
+
     antigravityMessages.push({
       role: "model",
       parts
-    })
+    });
   }
 }
 
-function handleToolCall(message, antigravityMessages){
-  // 从之前的 model 消息中找到对应的 functionCall name
+function handleToolCall(message, antigravityMessages) {
   let functionName = '';
   for (let i = antigravityMessages.length - 1; i >= 0; i--) {
     if (antigravityMessages[i].role === 'model') {
@@ -119,7 +136,7 @@ function handleToolCall(message, antigravityMessages){
       if (functionName) break;
     }
   }
-  
+
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const functionResponse = {
     functionResponse: {
@@ -130,8 +147,7 @@ function handleToolCall(message, antigravityMessages){
       }
     }
   };
-  
-  // 如果上一条消息是 user 且包含 functionResponse，则合并
+
   if (lastMessage?.role === "user" && lastMessage.parts.some(p => p.functionResponse)) {
     lastMessage.parts.push(functionResponse);
   } else {
@@ -141,22 +157,28 @@ function handleToolCall(message, antigravityMessages){
     });
   }
 }
-function openaiMessageToAntigravity(openaiMessages, modelName){
+
+function openaiMessageToAntigravity(openaiMessages, modelName) {
   const antigravityMessages = [];
   for (const message of openaiMessages) {
+    // 先消毒上游 content 中的 thinking 字段
+    const sanitizedContent = sanitizeIncomingContent(message.content);
+
     if (message.role === "user" || message.role === "system") {
-      const extracted = extractImagesFromContent(message.content);
+      const extracted = extractImagesFromContent(sanitizedContent);
       handleUserMessage(extracted, antigravityMessages);
     } else if (message.role === "assistant") {
-      handleAssistantMessage(message, antigravityMessages, modelName);
+      const sanitizedMessage = { ...message, content: sanitizedContent };
+      handleAssistantMessage(sanitizedMessage, antigravityMessages, modelName);
     } else if (message.role === "tool") {
-      handleToolCall(message, antigravityMessages);
+      const sanitizedMessage = { ...message, content: sanitizedContent };
+      handleToolCall(sanitizedMessage, antigravityMessages);
     }
   }
-  
   return antigravityMessages;
 }
-function generateGenerationConfig(parameters, enableThinking, actualModelName){
+
+function generateGenerationConfig(parameters, enableThinking, actualModelName) {
   const generationConfig = {
     topP: parameters.top_p ?? config.defaults.top_p,
     topK: parameters.top_k ?? config.defaults.top_k,
@@ -174,15 +196,16 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName){
       includeThoughts: enableThinking,
       thinkingBudget: enableThinking ? 1024 : 0
     }
-  }
-  if (enableThinking && actualModelName.includes("claude")){
+  };
+  if (enableThinking && actualModelName.includes("claude")) {
     delete generationConfig.topP;
   }
-  return generationConfig
+  return generationConfig;
 }
-function convertOpenAIToolsToAntigravity(openaiTools){
+
+function convertOpenAIToolsToAntigravity(openaiTools) {
   if (!openaiTools || openaiTools.length === 0) return [];
-  return openaiTools.map((tool)=>{
+  return openaiTools.map((tool) => {
     delete tool.function.parameters.$schema;
     return {
       functionDeclarations: [
@@ -192,39 +215,35 @@ function convertOpenAIToolsToAntigravity(openaiTools){
           parameters: tool.function.parameters
         }
       ]
-    }
-  })
+    };
+  });
 }
 
-function modelMapping(modelName){
-  if (modelName === "claude-sonnet-4-5-thinking"){
+function modelMapping(modelName) {
+  if (modelName === "claude-sonnet-4-5-thinking") {
     return "claude-sonnet-4-5";
-  } else if (modelName === "claude-opus-4-5"){
+  } else if (modelName === "claude-opus-4-5") {
     return "claude-opus-4-5-thinking";
-  } else if (modelName === "gemini-2.5-flash-thinking"){
+  } else if (modelName === "gemini-2.5-flash-thinking") {
     return "gemini-2.5-flash";
   }
   return modelName;
 }
 
-function isEnableThinking(modelName){
+// 启用思考的模型集合（Claude thinking 只在 generationConfig 层影响，不加 thought 标记）
+function isEnableThinking(modelName) {
   return modelName.endsWith('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
     modelName.startsWith('gemini-3-pro-') ||
     modelName === "rev19-uic3-1p" ||
-    modelName === "gpt-oss-120b-medium"
+    modelName === "gpt-oss-120b-medium";
 }
 
-function isClaudeThinking(modelName){
-  return modelName.startsWith('claude') && isEnableThinking(modelName);
-}
-
-function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,token){
-  
+function generateRequestBody(openaiMessages, modelName, parameters, openaiTools, token) {
   const enableThinking = isEnableThinking(modelName);
   const actualModelName = modelMapping(modelName);
-  
-  return{
+
+  return {
     project: token.projectId,
     requestId: generateRequestId(),
     request: {
@@ -244,14 +263,15 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools,tok
     },
     model: actualModelName,
     userAgent: "antigravity"
-  }
+  };
 }
-function getDefaultIp(){
+
+function getDefaultIp() {
   const interfaces = os.networkInterfaces();
-  if (interfaces.WLAN){
-    for (const inter of interfaces.WLAN){
-      if (inter.family === 'IPv4' && !inter.internal){
-          return inter.address;
+  if (interfaces.WLAN) {
+    for (const inter of interfaces.WLAN) {
+      if (inter.family === 'IPv4' && !inter.internal) {
+        return inter.address;
       }
     }
   } else if (interfaces.wlan2) {
@@ -263,7 +283,8 @@ function getDefaultIp(){
   }
   return '127.0.0.1';
 }
-export{
+
+export {
   generateRequestId,
   generateRequestBody,
   getDefaultIp
